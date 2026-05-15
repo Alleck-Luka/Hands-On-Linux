@@ -1,0 +1,2 @@
+ledPin = 18;
+ldrPin = 15;
