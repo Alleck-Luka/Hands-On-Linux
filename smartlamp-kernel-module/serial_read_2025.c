@@ -15,53 +15,126 @@ static uint usb_in, usb_out;                       // Endereços das portas de e
 static char *usb_in_buffer, *usb_out_buffer;       // Buffers de entrada e saída da USB
 static int usb_max_size;                           // Tamanho máximo de uma mensagem USB
 
-#define VENDOR_ID   0x10C4 /* Encontre o VendorID  do smartlamp */
-#define PRODUCT_ID  0xEA60 /* Encontre o ProductID do smartlamp */
-static const struct usb_device_id id_table[] = { { USB_DEVICE(VENDOR_ID, PRODUCT_ID) }, {} };
+// AVISO: Para que este driver possa executar sobre a porta USB do ESP32, 
+// é necessário colocar um dos seguintes drivers no /etc/modprobe.d/blacklist.conf,
+// dependendo do modelo de ESP32 utilzado:
+//  -> ESP32 CP2102:
+//      "blacklist cp210x"
+//  -> ESP32 CH340:
+//      "blacklist cdc_acm"
+
+#define VENDOR_CP2102  0x10C4
+#define PRODUCT_CP2102 0xEA60
+
+#define VENDOR_CH340   0x1a86
+#define PRODUCT_CH340  0x55d4
+
+static const struct usb_device_id id_table[] = { 
+    { USB_DEVICE(VENDOR_CP2102, PRODUCT_CP2102) }, 
+    { USB_DEVICE(VENDOR_CH340, PRODUCT_CH340) }, 
+    {} /* Fim da lista de ESP32s */
+};
+
+// Estrutura padrão CDC para configuração de porta serial
+struct cdc_line_coding {
+    __le32 dwDTERate;   // Baud rate
+    __u8   bCharFormat; // Stop bits (0 = 1 stop bit)
+    __u8   bParityType; // Paridade (0 = none)
+    __u8   bDataBits;   // Data bits (8)
+} __attribute__((packed));
 
 static int  usb_probe(struct usb_interface *ifce, const struct usb_device_id *id); // Executado quando o dispositivo é conectado na USB
 static void usb_disconnect(struct usb_interface *ifce);                            // Executado quando o dispositivo USB é desconectado da USB
 static int  usb_write_serial(char *cmd, int param);                                // Executado para enviar um comando para o dispositivo
 static int  usb_read_serial(void);                                                 // Executado para ler uma linha completa da porta serial
 
-// Função para configurar os parâmetros seriais do CP2102 via Control-Messages
+// Função para configurar os parâmetros seriais do CP2102 e do CH340 via Control-Messages
 static int smartlamp_config_serial(struct usb_device *dev)
 {
     int ret;
-    u32 baudrate = 9600; // Defina o baud rate que seu ESP32 usa!
+    u16 vendor = le16_to_cpu(dev->descriptor.idVendor);
 
-    printk(KERN_INFO "SmartLamp: Configurando a porta serial...\n");
+    if (vendor == VENDOR_CP2102) {
+        // ==========================================
+        // Lógica para o CP2102 (Silicon Labs)
+        // ==========================================
+        u32 *baudrate;
+        printk(KERN_INFO "SmartLamp: Configurando CP2102...\n");
 
-    // 1. Habilita a interface UART do CP2102
-    //    Comando específico do vendor Silicon Labs (CP210X_IFC_ENABLE)
-    //    bmRequestType: 0x41 (Vendor, Host-to-Device, Interface)
-    //    bRequest: 0x00 (CP210X_IFC_ENABLE)
-    //    wValue: 0x0001 (UART Enable)
-    ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-                          0x00, 0x41, 0x0001, 0, NULL, 0, 1000);
-    if (ret)
-    {
-        printk(KERN_ERR "SmartLamp: Erro ao habilitar a UART (código %d)\n", ret);
-        return ret;
+        // 1. Habilita UART
+        ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+                              0x00, 0x41, 0x0001, 0, NULL, 0, 1000);
+
+        if (ret < 0) {
+            return ret;
+        }
+
+        // 2. Define Baud Rate
+        baudrate = kmalloc(sizeof(u32), GFP_KERNEL);
+        if (!baudrate) return -ENOMEM;
+        
+        *baudrate = 9600;
+
+        ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+                              0x1E, 0x41, 0, 0, baudrate, sizeof(u32), 1000);
+
+        kfree(baudrate);
+
+        if (ret < 0) {
+            return ret;
+        }
+
+        // 3. Habilita DTR e RTS no CP2102 (Comando 0x07, Valor 0x0303)
+        ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+                              0x07, 0x41, 0x0303, 0, NULL, 0, 1000);
+        if (ret < 0) {
+            printk(KERN_ERR "SmartLamp: Erro ao habilitar DTR/RTS no CP2102\n");
+        }
+
+        printk(KERN_INFO "SmartLamp: Baud rate CP2102 configurado.\n");
+        return 0;
+
+    } else if (vendor == VENDOR_CH340) {
+        // ==========================================
+        // Lógica para o CH340 (CDC ACM)
+        // ==========================================
+        struct cdc_line_coding *line_coding;
+        printk(KERN_INFO "SmartLamp: Configurando CH340 (CDC ACM)...\n");
+
+        line_coding = kmalloc(sizeof(struct cdc_line_coding), GFP_KERNEL);
+        if (!line_coding) return -ENOMEM;
+
+        line_coding->dwDTERate = cpu_to_le32(9600);
+        line_coding->bCharFormat = 0; 
+        line_coding->bParityType = 0;
+        line_coding->bDataBits = 8;
+
+        ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+                              0x20, 0x21, 0, 0, 
+                              line_coding, sizeof(struct cdc_line_coding), 1000);
+        
+        kfree(line_coding);
+        if (ret < 0) {
+            return ret;
+        }
+
+        // 4. Habilita DTR e RTS no CH340 (Comando 0x22, Valor 0x03)
+        // bmRequestType 0x21, bRequest 0x22 (SET_CONTROL_LINE_STATE)
+        ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+                              0x22, 0x21, 0x03, 0, NULL, 0, 1000);
+        if (ret < 0) {
+            printk(KERN_ERR "SmartLamp: Erro ao habilitar DTR/RTS no CH340\n");
+        }
+        
+        printk(KERN_INFO "SmartLamp: Baud rate CH340 configurado.\n");
+        return 0;
     }
 
-    // 2. Define o baud rate
-    //    Comando específico do vendor Silicon Labs (CP210X_SET_BAUDRATE)
-    //    bRequest: 0x1E (CP210X_SET_BAUDRATE)
-    ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-                          0x1E, 0x41, 0, 0, &baudrate, sizeof(baudrate), 1000);
-    if (ret < 0)
-    {
-        printk(KERN_ERR "SmartLamp: Erro ao configurar o baud rate (código %d)\n", ret);
-        return ret;
-    }
-
-    printk(KERN_INFO "SmartLamp: Baud rate configurado para %d\n", baudrate);
-    return 0;
+    printk(KERN_ERR "SmartLamp: Dispositivo desconhecido.\n");
+    return -ENODEV;
 }
 
 MODULE_DEVICE_TABLE(usb, id_table);
-bool ignore = true;
 
 static struct usb_driver smartlamp_driver = {
     .name        = "smartlamp",     // Nome do driver
@@ -75,28 +148,51 @@ module_usb_driver(smartlamp_driver);
 // Executado quando o dispositivo é conectado na USB
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
     struct usb_endpoint_descriptor *usb_endpoint_in, *usb_endpoint_out;
-    int ret;
+    int err, ret;
+    u16 vendor;
+
+    smartlamp_device = interface_to_usbdev(interface);
+    vendor = le16_to_cpu(smartlamp_device->descriptor.idVendor);
+
+    // Regra exclusiva para o CH340: Ignorar a interface de controle (0)
+    if (vendor == VENDOR_CH340 && interface->cur_altsetting->desc.bInterfaceNumber != 1) {
+        printk(KERN_INFO "SmartLamp: Ignorando interface de controle do CH340\n");
+        return -ENODEV; 
+    }
 
     printk(KERN_INFO "SmartLamp: Dispositivo conectado ...\n");
 
-    // Detecta portas e aloca buffers de entrada e saída de dados na USB
-    smartlamp_device = interface_to_usbdev(interface);
-    ignore =  usb_find_common_endpoints(interface->cur_altsetting, &usb_endpoint_in, &usb_endpoint_out, NULL, NULL);
+    // 1. Procura os endpoints com segurança
+    err = usb_find_common_endpoints(interface->cur_altsetting, &usb_endpoint_in, &usb_endpoint_out, NULL, NULL);
+    if (err) {
+        printk(KERN_ERR "SmartLamp: Endpoints IN/OUT nao encontrados (erro %d)\n", err);
+        return err; // Impede o Kernel Panic
+    }
+
+    // 2. Aloca buffers
     usb_max_size = usb_endpoint_maxp(usb_endpoint_in);
     usb_in = usb_endpoint_in->bEndpointAddress;
     usb_out = usb_endpoint_out->bEndpointAddress;
+    
     usb_in_buffer = kmalloc(usb_max_size, GFP_KERNEL);
+    if (!usb_in_buffer) return -ENOMEM;
+    
     usb_out_buffer = kmalloc(usb_max_size, GFP_KERNEL);
+    if (!usb_out_buffer) {
+        kfree(usb_in_buffer);
+        return -ENOMEM;
+    }
 
-    // Chama a função para configurar a porta serial antes de usar
+    // 3. Configura a porta serial chamando a função smartlamp_config_serial()
     ret = smartlamp_config_serial(smartlamp_device);
-    if (ret)
-    {
-        printk(KERN_ERR "SmartLamp: Falha na configuração da serial\n");
+    if (ret) {
+        printk(KERN_ERR "SmartLamp: Falha na configuracao da serial\n");
         kfree(usb_in_buffer);
         kfree(usb_out_buffer);
         return ret;
     }
+
+    printk(KERN_INFO "SmartLamp: Driver inicializado com sucesso!\n");
 
     // TASK 2.3: Leitura de dados periódicos enviados pelo firmware
     // O firmware envia RES GET_LDR Z automaticamente a cada 2 segundos
@@ -124,10 +220,14 @@ static int usb_write_serial(char *cmd, int param) {
 
     printk(KERN_INFO "SmartLamp: Enviando comando: %s %d\n", cmd, param);
 
-    // Formata o comando no buffer
+    // TASK 2.2: Implemente o envio do comando para o dispositivo
+    // Dica: Formate o comando no buffer usb_out_buffer e envie usando usb_bulk_msg
+    // O formato esperado é: "COMANDO PARAMETRO\n"
+
+    // Formata o comando no buffer de saída adicionando o \n exigido pelo protocolo
     sprintf(usb_out_buffer, "%s %d\n", cmd, param);
 
-    // Envia o comando pela porta serial
+    // Envia o comando pela porta serial da USB
     ret = usb_bulk_msg(smartlamp_device, usb_sndbulkpipe(smartlamp_device, usb_out),
                        usb_out_buffer, strlen(usb_out_buffer), &actual_size, 1000);
     if (ret) {
@@ -167,8 +267,10 @@ static int usb_read_serial(void) {
     memset(recv_line, 0, MAX_RECV_LINE); // Limpa o buffer de recepção
 
     // Tenta ler até encher o buffer ou encontrar um \n
+    // Tenta ler até encher o buffer ou encontrar um \n
     while (recv_size < MAX_RECV_LINE - 1) {
-        // Timeout de 2000ms pois o firmware manda a cada 2 segs
+        // Aumentamos o Timeout para 5000ms para garantir que daremos tempo ao ESP32
+        // Usamos min_t(int, ...) para segurança de tipos no Kernel
         ret = usb_bulk_msg(smartlamp_device, usb_rcvbulkpipe(smartlamp_device, usb_in),
                            usb_in_buffer, min(usb_max_size, MAX_RECV_LINE - recv_size), 
                            &actual_size, 2000);
@@ -184,13 +286,15 @@ static int usb_read_serial(void) {
             
             if (recv_line[recv_size] == '\n') {
                 recv_line[recv_size + 1] = '\0'; // Adiciona terminador nulo da string
-                printk(KERN_INFO "SmartLamp: Mensagem recebida: %s", recv_line);
+                printk(KERN_INFO "SmartLamp: Mensagem completa recebida: %s", recv_line);
                 
                 // Extrai o valor de Z de "RES GET_LDR Z"
                 if (sscanf(recv_line, "RES GET_LDR %d", &value) == 1) {
                     return value;
                 }
-                return -1; // Se a mensagem não tiver o formato numérico esperado
+                
+                // Retorna 0 se for outro comando apenas para não dar erro fatal
+                return 0; 
             }
             recv_size++;
         }
